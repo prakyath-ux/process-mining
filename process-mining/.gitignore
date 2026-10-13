@@ -1,0 +1,44 @@
+# Python virtual environments
+**/.venv/
+**/venv/
+**/env/
+
+# Python cache and test artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Local databases / generated files
+*.sqlite3
+*.db
+*.db-*
+*.db-shm
+*.db-wal
+*.log
+
+# Node / frontend generated files
+**/node_modules/
+**/.next/
+**/dist/
+**/build/
+frontend/next-env.d.ts
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# OS / editor junk
+.DS_Store
+.vscode/
+.idea/
+
+# Data files generated during demo runs
+sample_data/*.csv
