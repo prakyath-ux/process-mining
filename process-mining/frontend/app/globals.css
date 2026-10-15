@@ -234,6 +234,24 @@ table.data tr:hover td { background: rgba(79, 140, 255, 0.05); }
 .timeline-bar-fill { display: block; height: 100%; background: var(--accent-2); border-radius: 4px; }
 .timeline-bar-fill.hot { background: var(--warn); }
 
+/* --- ingest progress panel (real, server-reported progress) --- */
+.progress-panel {
+  background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px;
+  padding: 14px 16px; margin-top: 16px;
+}
+.progress-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+.progress-stage { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600; color: var(--text); }
+.progress-elapsed { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.progress-stats { font-size: 12px; color: var(--muted); margin-top: 8px; }
+.progress-stats .warn { color: var(--warn); }
+.spinner {
+  width: 12px; height: 12px; border-radius: 50%; flex-shrink: 0;
+  border: 2px solid var(--border); border-top-color: var(--accent);
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.progress-panel .bar-fill { min-width: 6px; }
+
 /* --- dotted timeline chart --- */
 .chart-wrap {
   border: 1px solid var(--border); border-radius: 10px; overflow: auto;

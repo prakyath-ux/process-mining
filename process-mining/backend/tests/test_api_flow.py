@@ -1,5 +1,7 @@
 """End-to-end API flow tests: auth → ingest → mine → discover → conformance."""
 
+import json
+
 from .conftest import SMALL_CSV, b64
 
 
@@ -117,6 +119,42 @@ def test_audit_trail(client, auth_headers, uploaded_log):
     assert "ingest_completed" in actions
     assert "model_discovered" in actions
     assert "conformance_run" in actions
+
+
+def test_ingest_streaming_progress(client, auth_headers):
+    """`?stream=1` emits NDJSON stage/progress/done events while ingesting."""
+    resp = client.post(
+        "/api/ingest/file?stream=true",
+        headers=auth_headers,
+        files={"file": ("stream.csv", SMALL_CSV.encode(), "text/csv")},
+        data={
+            "name": "stream-log",
+            "case_col": "case_id",
+            "activity_col": "activity",
+            "timestamp_col": "timestamp",
+            "attr_columns": "amount",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert "application/x-ndjson" in resp.headers["content-type"]
+
+    events = [json.loads(line) for line in resp.text.splitlines() if line.strip()]
+    assert events, "stream contained no events"
+    assert events[0]["type"] == "stage" and events[0]["stage"] == "parsing"
+    assert events[0]["total"] == 12  # header excluded: 12 data rows
+    done = [e for e in events if e["type"] == "done"]
+    assert len(done) == 1
+    assert done[0]["inserted"] == 12 and done[0]["skipped"] == 0
+    assert "elapsed_s" in done[0]
+    # every line carries elapsed time, and progress events exist before done
+    assert all("elapsed_s" in e for e in events)
+    assert any(e["type"] == "progress" for e in events)
+
+    # the log must be usable right after the stream finishes
+    got = client.get(f"/api/logs/{done[0]['log_id']}", headers=auth_headers)
+    assert got.status_code == 200
+    assert got.json()["status"] == "ready"
+    assert got.json()["event_count"] == 12
 
 
 def test_rbac_viewer_cannot_ingest(client, auth_headers):

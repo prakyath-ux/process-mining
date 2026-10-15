@@ -1,14 +1,34 @@
-"""Ingestion API: upload CSV/XES files or pull from an external SQL source."""
+"""Ingestion API: upload CSV/XES files or pull from an external SQL source.
+
+Uploads support two response modes:
+- classic JSON (default): one response after ingestion completes
+- streaming (`?stream=1`): NDJSON events emitted while ingestion runs
+  (stage / progress / done / error), so the UI can show real progress
+"""
 
 import base64
+import json
+import queue
+import threading
+import time
+from collections.abc import Iterator
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    UploadFile,
+)
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from ..audit import record_audit
 from ..config import get_settings
-from ..db import get_db
+from ..db import SessionLocal, get_db
 from ..ingestion import ColumnMapping, ingest_csv, ingest_sql, ingest_xes, peek_csv_columns
 from ..models import EventLog, User
 from ..security import require_role
@@ -82,6 +102,109 @@ def _mapping_from_form(
     )
 
 
+def _ndjson(obj: dict) -> str:
+    return json.dumps(obj, default=str) + "\n"
+
+
+def _run_stream(
+    log_id: int,
+    source_type: str,
+    user: User,
+    run,  # run(session, log_row, progress) -> result dict
+) -> StreamingResponse:
+    """Execute `run` on a worker thread and stream its progress as NDJSON.
+
+    The response body is one JSON object per line:
+      {"type":"stage","stage":"parsing"|"stats"|"working", ...}
+      {"type":"progress","inserted":N,"skipped":N,"total":N|null, ...}
+      {"type":"done","log_id":N,"inserted":N,"skipped":N}   (terminal)
+      {"type":"error","detail":"..."}                          (terminal)
+    every line carries `elapsed_s` since the ingest started. The worker owns
+    its own DB session so it never touches the request-scoped one.
+    """
+    q: queue.Queue = queue.Queue()
+    started = time.perf_counter()
+    user_id = user.id
+    done_payload: dict = {}
+
+    def worker() -> None:
+        session = SessionLocal()
+        try:
+            row = session.get(EventLog, log_id)
+            actor = session.get(User, user_id) if user_id else None
+
+            def progress(event: dict) -> None:
+                event["elapsed_s"] = round(time.perf_counter() - started, 2)
+                q.put(event)
+
+            try:
+                result = run(session, row, progress)
+                row.status = "ready"
+                record_audit(
+                    session,
+                    action="ingest_completed",
+                    user=actor,
+                    resource=f"log:{log_id}",
+                    detail={"source": source_type, **result},
+                )
+                session.commit()
+                done_payload.update({
+                    "type": "done",
+                    "log_id": log_id,
+                    "source_type": source_type,
+                    "elapsed_s": round(time.perf_counter() - started, 2),
+                    **result,
+                })
+                q.put(dict(done_payload))
+            except Exception as exc:  # noqa: BLE001 - failures must reach the stream, not 500
+                session.rollback()
+                row.status = "failed"
+                record_audit(
+                    session,
+                    action="ingest_failed",
+                    user=actor,
+                    resource=f"log:{log_id}",
+                    detail={"error": str(exc)[:500]},
+                )
+                session.commit()
+                q.put({
+                    "type": "error",
+                    "log_id": log_id,
+                    "detail": str(exc)[:500],
+                    "elapsed_s": round(time.perf_counter() - started, 2),
+                })
+        finally:
+            session.close()
+            q.put(None)  # sentinel: the reader must never block forever
+
+    threading.Thread(target=worker, name="ingest-worker", daemon=True).start()
+
+    def gen() -> Iterator[str]:
+        while True:
+            try:
+                item = q.get(timeout=0.5)
+            except queue.Empty:
+                # keepalive: long phases (e.g. pm4py parsing an XES file) emit
+                # nothing for seconds at a time — keep the client's timer live.
+                yield _ndjson({
+                    "type": "stage",
+                    "stage": "working",
+                    "elapsed_s": round(time.perf_counter() - started, 2),
+                })
+                continue
+            if item is None:
+                break
+            yield _ndjson(item)
+            if item["type"] in ("done", "error"):
+                break
+
+    return StreamingResponse(
+        gen(),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @router.post("/file", status_code=201)
 async def ingest_file(
     file: UploadFile = File(...),
@@ -93,6 +216,7 @@ async def ingest_file(
     lifecycle_col: str = Form(""),
     attr_columns: str = Form(""),
     delimiter: str = Form(","),
+    stream: bool = Query(default=False, description="Stream NDJSON progress while ingesting"),
     user: User = Depends(require_role("analyst")),
     db: Session = Depends(get_db),
 ):
@@ -122,6 +246,17 @@ async def ingest_file(
     db.add(log)
     db.commit()
     db.refresh(log)
+    log_id = log.id
+
+    if stream:
+        # Live progress mode: the worker owns its own DB session; the
+        # request-scoped one is done after we return the response.
+        def run(session: Session, row: EventLog, progress) -> dict:
+            if source_type == "xes":
+                return ingest_xes(session, row, data, mapping, progress=progress)
+            return ingest_csv(session, row, data, mapping, delimiter=delimiter, progress=progress)
+
+        return _run_stream(log_id, source_type, user, run)
 
     try:
         if source_type == "xes":

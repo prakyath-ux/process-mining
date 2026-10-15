@@ -1,15 +1,45 @@
 "use client";
 
-/** CSV/XES upload with column-mapping preview, plus SQL pull (admin). */
+/** CSV/XES upload with column-mapping preview, plus SQL pull (admin).
+ *  Uploads use the NDJSON streaming mode so the panel below shows real,
+ *  server-reported progress while ingestion runs. */
 
 import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import Shell from "@/components/Shell";
-import { API_URL, api, getUser, type Role } from "@/lib/api";
+import { API_URL, api, fmtNumber, getUser, type IngestEvent, type Role } from "@/lib/api";
 
 interface Preview {
   columns: string[];
   rows: Record<string, string>[];
+}
+
+/** Live state mirrored from the server's NDJSON stream. */
+interface Progress {
+  stage: string;
+  total: number | null;
+  inserted: number;
+  skipped: number;
+  elapsed: number;
+}
+
+const IDLE: Progress = { stage: "uploading", total: null, inserted: 0, skipped: 0, elapsed: 0 };
+
+function stageLabel(stage: string): string {
+  switch (stage) {
+    case "uploading":
+      return "Uploading file";
+    case "parsing":
+      return "Parsing events";
+    case "stats":
+      return "Computing statistics";
+    case "working":
+      return "Processing";
+    case "done":
+      return "Finished";
+    default:
+      return "Writing events";
+  }
 }
 
 export default function IngestPage() {
@@ -28,6 +58,7 @@ export default function IngestPage() {
   const [attrCols, setAttrCols] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [progress, setProgress] = useState<Progress | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
 
   // SQL form
@@ -95,6 +126,7 @@ export default function IngestPage() {
     setBusy(true);
     setError(null);
     setSuccess(null);
+    setProgress(IDLE);
     try {
       const form = new FormData();
       form.append("file", file);
@@ -105,18 +137,51 @@ export default function IngestPage() {
       form.append("timestamp_col", tsCol);
       form.append("lifecycle_col", lifecycleCol);
       form.append("attr_columns", attrCols);
-      const res = await api.postForm<{ log_id: number; inserted: number; skipped: number }>(
-        "/api/ingest/file",
-        form
-      );
+
+      const onEvent = (ev: IngestEvent) => {
+        setProgress((prev) => {
+          const cur = prev ?? IDLE;
+          if (ev.type === "stage") {
+            return {
+              ...cur,
+              stage: ev.stage ?? cur.stage,
+              total: ev.total !== undefined ? ev.total : cur.total,
+              elapsed: ev.elapsed_s ?? cur.elapsed,
+            };
+          }
+          if (ev.type === "progress") {
+            return {
+              stage: "writing",
+              total: ev.total,
+              inserted: ev.inserted,
+              skipped: ev.skipped,
+              elapsed: ev.elapsed_s ?? cur.elapsed,
+            };
+          }
+          if (ev.type === "done") {
+            return {
+              stage: "done",
+              total: ev.inserted + ev.skipped,
+              inserted: ev.inserted,
+              skipped: ev.skipped,
+              elapsed: ev.elapsed_s ?? cur.elapsed,
+            };
+          }
+          return cur;
+        });
+      };
+
+      const res = await api.postFormStream("/api/ingest/file?stream=true", form, onEvent);
       setSuccess(
-        `Ingested ${res.inserted.toLocaleString()} events (${res.skipped.toLocaleString()} rows skipped). Opening log…`
+        `Ingested ${fmtNumber(res.inserted)} events (${fmtNumber(res.skipped)} rows skipped) ` +
+          `in ${res.elapsed_s}s. Opening log…`
       );
       setTimeout(() => router.push(`/logs/${res.log_id}`), 900);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Ingestion failed");
     } finally {
       setBusy(false);
+      setProgress(null);
     }
   }
 
@@ -224,6 +289,43 @@ export default function IngestPage() {
         {isXes && (
           <div className="notice-banner" style={{ marginTop: 12 }}>
             XES: standard keys will be used (case:concept:name / concept:name / time:timestamp).
+          </div>
+        )}
+
+        {busy && progress && (
+          <div className="progress-panel" aria-live="polite">
+            <div className="progress-head">
+              <span className="progress-stage">
+                <span className="spinner" aria-hidden />
+                {stageLabel(progress.stage)}…
+              </span>
+              <span className="progress-elapsed">
+                {progress.elapsed.toFixed(1)}s elapsed
+              </span>
+            </div>
+            <div className="bar-track" role="progressbar">
+              <div
+                className="bar-fill"
+                style={{
+                  width: `${
+                    progress.total && progress.total > 0
+                      ? Math.min(100, Math.round(((progress.inserted + progress.skipped) / progress.total) * 100))
+                      : 8
+                  }%`,
+                  transition: "width 0.25s ease",
+                }}
+              />
+            </div>
+            <div className="progress-stats mono">
+              {fmtNumber(progress.inserted)} / {progress.total != null ? fmtNumber(progress.total) : "?"} rows
+              {progress.skipped > 0 && <span className="warn"> · {fmtNumber(progress.skipped)} skipped</span>}
+              {progress.elapsed > 0 && progress.inserted > 0 && (
+                <span>
+                  {" "}
+                  · {fmtNumber(Math.round(progress.inserted / progress.elapsed))} rows/s
+                </span>
+              )}
+            </div>
           </div>
         )}
 

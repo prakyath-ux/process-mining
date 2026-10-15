@@ -112,6 +112,14 @@ for model checking. An LLM could later *narrate* findings ("Credit Review adds
   it in batches. Failed loads are marked `failed`, not silently dropped
   (you saw "skipped: 0" for clean data).
 
+  While it loads you get a **live progress panel**: current stage (parsing →
+  writing → computing statistics), a progress bar, rows written / total,
+  elapsed seconds and rows/sec. These are **not animated placeholders** — the
+  server streams real counters over NDJSON (`POST /api/ingest/file?stream=1`)
+  from the batch writer itself, so the numbers match the file you uploaded.
+  A 245k-row file reports 50 progress ticks and finishes in ~9s (it took
+  ~70s before the timestamp fast path).
+
 - **Audit Trail** = the compliance black box. Every meaningful action —
   login, ingest, model discovery, conformance run — is written to an
   **append-only** table with *who, what, when*. This is the evidence for
@@ -169,7 +177,12 @@ next actor picked the work up.
    *from* this same data. (Baseline behavior — deviations appear when you
    check against a *regulatory* reference model.)
 7. **Ingest Data** → upload your own CSV, watch the column auto-guess, map,
-   ingest → a new log appears in the list.
+   ingest → watch the **live progress panel** (stage, bar, rows, rows/s)
+   while it loads → a new log appears in the list. To try other processes,
+   generate 3 more demo logs first:
+   `python3 scripts/generate_demo_logs.py` → **Purchase-to-Pay** (bottleneck
+   + conformance deviations), **Insurance Claims** (case drill-down),
+   **IT Incidents** (handover network).
 8. **Audit Trail** → everything you just did, listed with timestamps.
 9. **New tabs**: try **Cases** (search `LN-0042` → click a case → timeline),
    **Timeline** (dotted chart), **Handover** (bot↔human network), and on
@@ -191,6 +204,10 @@ next actor picked the work up.
 ### Ingestion
 - CSV upload with **column-preview + auto-guess mapping**
   (case / activity / timestamp / lifecycle / extra attrs)
+- **Live progress streaming**: `?stream=1` returns NDJSON
+  (`stage` → `progress` → `done`/`error`, each with elapsed seconds) while
+  the ingest runs; the Ingest page renders it as stage label + progress bar
+  + rows/s. Classic JSON mode (no query param) is unchanged
 - XES upload (process-mining standard format), auto-mapped
 - **SQL pull** (admin): read-only SELECT from an external DB; credentials
   are used for the query and never stored

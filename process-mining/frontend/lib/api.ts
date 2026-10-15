@@ -210,6 +210,27 @@ export interface AuditRow {
   created_at: string;
 }
 
+export type IngestEvent =
+  | { type: "stage"; stage?: string; total?: number | null; elapsed_s?: number }
+  | {
+      type: "progress";
+      inserted: number;
+      skipped: number;
+      total: number | null;
+      elapsed_s?: number;
+    }
+  | {
+      type: "done";
+      log_id: number;
+      source_type: string;
+      inserted: number;
+      skipped: number;
+      elapsed_s?: number;
+    }
+  | { type: "error"; log_id: number; detail: string; elapsed_s?: number };
+
+export type IngestDone = Extract<IngestEvent, { type: "done" }>;
+
 export function getToken(): string | null {
   if (typeof window === "undefined") return null;
   return localStorage.getItem(TOKEN_KEY);
@@ -274,6 +295,70 @@ export const api = {
     request<T>(path, { method: "POST", body: body !== undefined ? JSON.stringify(body) : undefined }),
   postForm: <T>(path: string, form: FormData) => request<T>(path, { method: "POST", body: form }),
   del: <T>(path: string) => request<T>(path, { method: "DELETE" }),
+
+  /**
+   * POST a multipart form and stream back NDJSON progress events while the
+   * server works. `onEvent` fires per line; resolves with the terminal
+   * `done` event, throws ApiError on HTTP failure, on a stream-embedded
+   * `error` event, or if the stream ends without a terminal event.
+   */
+  async postFormStream(
+    path: string,
+    form: FormData,
+    onEvent: (e: IngestEvent) => void
+  ): Promise<IngestDone> {
+    const headers: Record<string, string> = {};
+    const token = getToken();
+    if (token) headers.Authorization = `Bearer ${token}`;
+    const res = await fetch(`${API_URL}${path}`, { method: "POST", headers, body: form });
+    if (res.status === 401 && typeof window !== "undefined") {
+      clearSession();
+      if (!window.location.pathname.startsWith("/login")) {
+        window.location.href = "/login";
+        throw new ApiError(401, "Session expired");
+      }
+    }
+    if (!res.ok || !res.body) {
+      let detail = res.statusText;
+      try {
+        const body = await res.json();
+        detail = typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail ?? body);
+      } catch {
+        /* keep statusText */
+      }
+      throw new ApiError(res.status, detail);
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    let doneEvent: IngestDone | null = null;
+    const handle = (line: string) => {
+      const evt = JSON.parse(line) as IngestEvent;
+      if (evt.type === "error") {
+        throw new ApiError(400, evt.detail);
+      }
+      if (evt.type === "done") doneEvent = evt;
+      onEvent(evt);
+    };
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let nl = buf.indexOf("\n");
+      while (nl >= 0) {
+        const line = buf.slice(0, nl);
+        buf = buf.slice(nl + 1);
+        if (line.trim()) handle(line);
+        nl = buf.indexOf("\n");
+      }
+    }
+    if (buf.trim()) handle(buf);
+    if (!doneEvent) {
+      throw new ApiError(0, "Connection closed before ingestion finished");
+    }
+    return doneEvent;
+  },
 
   async login(email: string, password: string): Promise<SessionUser> {
     const form = new URLSearchParams({ username: email, password });
